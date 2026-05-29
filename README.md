@@ -279,3 +279,4 @@ If you change the backend port, update `VITE_API_URL` in a `.env` file in the fr
 VITE_API_URL=http://localhost:8001
 ```
 # avg-bank-balance-calc
+# avg-bank-balance-calc
