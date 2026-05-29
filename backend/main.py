@@ -4,6 +4,7 @@ from fastapi.responses import Response
 from typing import Optional
 import calendar
 import io
+import os
 import pdfplumber
 
 from parser import parse_pdf, detect_columns, _infer_columns_from_data, OPENING_BALANCE_KEY
@@ -13,9 +14,14 @@ from utils import build_pdf_report
 
 app = FastAPI(title="Average Bank Balance Calculator")
 
+# CORS — allow the deployed frontend origin (set via FRONTEND_URL env var on Render)
+# Falls back to wildcard for local development when env var is not set.
+_frontend_url = os.environ.get("FRONTEND_URL", "")
+_origins = [_frontend_url] if _frontend_url else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
