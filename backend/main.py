@@ -21,14 +21,11 @@ from utils import build_pdf_report
 
 app = FastAPI(title="Average Bank Balance Calculator")
 
-# CORS — allow the deployed frontend origin (set via FRONTEND_URL env var on Render)
-# Falls back to wildcard for local development when env var is not set.
-_frontend_url = os.environ.get("FRONTEND_URL", "")
-_origins = [_frontend_url] if _frontend_url else ["*"]
-
+# CORS — always allow all origins so the deployed frontend can reach the backend.
+# This is safe for a public read-only tool with no authentication.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_origins,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -253,6 +250,7 @@ async def raw_dump(
     return out
 
 
+@app.post("/audit")
 async def audit_statement(
     file: UploadFile = File(...),
     password: Optional[str] = Form(None),
