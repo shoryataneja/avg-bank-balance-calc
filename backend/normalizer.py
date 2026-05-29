@@ -1,60 +1,38 @@
 """
-normalizer.py - Transaction normalization layer.
+normalizer.py — Transaction normalization layer.
 
-Converts raw {date: [balances-in-PDF-order]} into a structure where every
-date's balance list is in true chronological order, regardless of whether
-the source PDF is ascending or descending.
+Core principle (per Kotak descending format):
+    Transactions are kept in EXACT PDF row order.
+    The sort direction is detected and passed to the calculator.
+    The calculator uses it to pick the correct closing balance index:
 
-Core principle:
-    Within a single date, transactions appear in the PDF in the same order
-    as the overall statement direction. If the statement is descending
-    (newest-first), then within each date the transactions are also listed
-    newest-first and must be reversed to get chronological order.
+        ASCENDING  → closing balance = transactions[-1]  (last row = latest)
+        DESCENDING → closing balance = transactions[0]   (first row = latest)
 
-    We detect the statement direction from the date key order (reliable),
-    then apply a simple reverse for descending PDFs (correct and deterministic).
-    No heuristics, no permutations.
+    For Kotak descending:
+        Sl.1  30/06  103422  ← newest = closing balance → use [0]
+        Sl.2  30/06  103417
+        Sl.3  30/06   93417
+        Sl.4  30/06   94985
+        Sl.5  30/06  106265  ← oldest
+
+    DO NOT reverse transactions. DO NOT reorder anything.
+    Just detect direction and let the calculator pick the right index.
 
 Flow:
-    parse_pdf() -> normalize() -> group_by_month() -> calculate_averages()
+    parse_pdf() → normalize() → group_by_month() → calculate_averages()
 """
 
 import logging
-from dataclasses import dataclass
 from datetime import date
-from typing import Optional
-from collections import defaultdict
 
 from parser import OPENING_BALANCE_KEY
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Transaction:
-    """A single parsed transaction with its PDF provenance."""
-    date: date
-    balance: float
-    pdf_row_index: int    # 0-based global row counter reflecting PDF position
-    day_sequence: int = 0 # assigned after normalization: 0 = chronologically first
-
-
-@dataclass
-class DailyBalance:
-    """Normalized summary for a single calendar day."""
-    date: date
-    first_balance: float   # chronologically FIRST transaction balance
-    last_balance: float    # chronologically LAST transaction balance (closing)
-    transaction_count: int
-
-
 # Type aliases
-RawTransactions  = dict[date, list[float]]  # parser output: PDF row order
-NormTransactions = dict[date, list[float]]  # normalized: chronological order
+RawTransactions  = dict[date, list[float]]
+NormTransactions = dict[date, list[float]]
 
 
 # ---------------------------------------------------------------------------
@@ -91,152 +69,83 @@ def detect_bank(pdf_text: str) -> str:
 
 def detect_sort_order(raw: RawTransactions) -> str:
     """
-    Determine whether the PDF presents dates in ascending or descending order
-    by inspecting the insertion order of date keys (which reflects PDF row order).
+    Compare the first date key seen in the PDF against the last date key seen.
+
+    Python dicts preserve insertion order. The parser inserts date keys in the
+    order rows are encountered, so keys[0] = first date in PDF,
+    keys[-1] = last date in PDF.
+
+    first_date > last_date  →  DESCENDING  (newest date printed first)
+    first_date < last_date  →  ASCENDING   (oldest date printed first)
 
     Returns 'asc', 'desc', or 'single'.
-
-    This is reliable because date keys are inserted in the order rows are
-    encountered in the PDF. If the first date key is later than the last,
-    the PDF is descending.
     """
     keys = [d for d in raw if d != OPENING_BALANCE_KEY]
     if len(keys) < 2:
         return "single"
 
-    # Count consecutive ascending vs descending date pairs
-    asc_pairs  = sum(1 for a, b in zip(keys, keys[1:]) if a <= b)
-    desc_pairs = sum(1 for a, b in zip(keys, keys[1:]) if a >= b)
-    order = "desc" if desc_pairs > asc_pairs else "asc"
+    first_seen = keys[0]
+    last_seen  = keys[-1]
+    order = "desc" if first_seen > last_seen else "asc"
 
-    real_dates = sorted(keys)
     logger.info(
-        "Statement order detected: %s | first key=%s | last key=%s | date range %s to %s",
-        order.upper(), keys[0], keys[-1], real_dates[0], real_dates[-1],
+        "detect_sort_order: first_date_in_pdf=%s  last_date_in_pdf=%s  →  %s",
+        first_seen, last_seen, order.upper(),
     )
     return order
 
 
 # ---------------------------------------------------------------------------
-# Core normalization
+# Normalize — keep PDF order, just pass sort_order through
 # ---------------------------------------------------------------------------
 
 def normalize(raw: RawTransactions, bank: str = "UNKNOWN") -> NormTransactions:
     """
-    Convert raw parser output into a NormTransactions dict where every date's
-    balance list is in true chronological order (oldest transaction first).
+    Return transactions in exact PDF row order with sort_order embedded.
 
-    Algorithm:
-    1. Detect statement direction (asc or desc) from date key order.
-    2. Expand {date: [balances]} into flat Transaction objects with pdf_row_index.
-    3. Sort all transactions by date ascending (unambiguous — dates are absolute).
-    4. Within each date, sort by pdf_row_index:
-         - Ascending PDF:  lower pdf_row_index = earlier transaction -> sort ASC
-         - Descending PDF: lower pdf_row_index = later transaction   -> sort DESC
-           (because the whole PDF is reversed, so the first row of a date in a
-            descending PDF is the LAST transaction of that day chronologically)
-    5. Assign day_sequence (0 = first, N-1 = last/closing).
-    6. Re-group into {date: [balances in chronological order]}.
-    7. Log per-day transaction details for validation.
+    Transactions are NOT reordered. The sort_order is stored under the
+    special key '__sort_order__' so the calculator can read it and pick
+    the correct closing balance index per date:
 
-    After normalization:
-        txns[d][0]  = FIRST transaction of day d  (chronologically earliest)
-        txns[d][-1] = LAST  transaction of day d  (closing balance)
+        ASCENDING  → closing = txns[d][-1]
+        DESCENDING → closing = txns[d][0]
+
+    Per-date debug log shows raw balances and which one is selected as closing.
     """
-    opening    = raw.get(OPENING_BALANCE_KEY)
     sort_order = detect_sort_order(raw)
-    is_desc    = (sort_order == "desc")
+    opening    = raw.get(OPENING_BALANCE_KEY)
 
-    # ── Step 1: Expand into flat Transaction list ────────────────────────────
-    all_txns: list[Transaction] = []
-    pdf_row = 0
+    normalized: NormTransactions = {}
+
     for d, balances in raw.items():
         if d == OPENING_BALANCE_KEY:
             continue
-        for bal in balances:
-            all_txns.append(Transaction(
-                date=d,
-                balance=bal,
-                pdf_row_index=pdf_row,
-            ))
-            pdf_row += 1
+        normalized[d] = balances  # exact PDF order, no changes
 
-    # ── Step 2: Group by date ────────────────────────────────────────────────
-    by_date: dict[date, list[Transaction]] = defaultdict(list)
-    for txn in all_txns:
-        by_date[txn.date].append(txn)
-
-    # ── Step 3: Order each day's transactions chronologically ────────────────
-    #
-    # Key insight: within a single date, transactions appear in the PDF in the
-    # same direction as the overall statement.
-    #
-    # Ascending PDF (e.g. Kotak):
-    #   Date rows appear oldest-first. Within a date, pdf_row_index increases
-    #   with time. Sort ASC by pdf_row_index -> chronological order.
-    #
-    # Descending PDF (e.g. HDFC):
-    #   Date rows appear newest-first. Within a date, pdf_row_index increases
-    #   going BACKWARD in time. Sort DESC by pdf_row_index -> chronological order.
-    #   (Equivalently: sort ASC then reverse.)
-    #
-    ordered_txns: list[Transaction] = []
-
-    for d in sorted(by_date.keys()):
-        day_txns = sorted(by_date[d], key=lambda t: t.pdf_row_index, reverse=is_desc)
-
-        # Assign day_sequence: 0 = chronologically first, N-1 = chronologically last
-        for seq, txn in enumerate(day_txns):
-            txn.day_sequence = seq
-
-        ordered_txns.extend(day_txns)
-
-        # ── Per-day validation log ───────────────────────────────────────────
-        logger.debug("Date: %s | Transactions Found:", d)
-        for txn in day_txns:
-            logger.debug("  Txn %d -> Balance %.2f", txn.day_sequence + 1, txn.balance)
+        # Debug: show raw balances and selected closing for this date
+        closing = balances[0] if sort_order == "desc" else balances[-1]
         logger.debug(
-            "  Detected FIRST: %.2f | Detected LAST: %.2f",
-            day_txns[0].balance, day_txns[-1].balance,
+            "Date: %s | statement_order: %s | raw_balances: %s | selected_closing: %.2f",
+            d, sort_order.upper(),
+            [round(b, 2) for b in balances],
+            closing,
         )
 
-    # ── Step 4: Re-group into NormTransactions ───────────────────────────────
-    normalized: NormTransactions = {}
-    for txn in ordered_txns:
-        normalized.setdefault(txn.date, []).append(txn.balance)
+    # Embed sort_order so calculator can read it without a separate argument
+    normalized["__sort_order__"] = sort_order  # type: ignore[assignment]
 
     if opening is not None:
         normalized[OPENING_BALANCE_KEY] = opening
 
-    # ── Summary log ─────────────────────────────────────────────────────────
-    real_dates = sorted(d for d in normalized if d != OPENING_BALANCE_KEY)
-    total_txns = sum(len(v) for k, v in normalized.items() if k != OPENING_BALANCE_KEY)
+    real_dates = sorted(d for d in normalized
+                        if d not in (OPENING_BALANCE_KEY, "__sort_order__"))
+    total_txns = sum(len(normalized[d]) for d in real_dates)
+
     logger.info(
-        "normalize [bank=%s, order=%s]: %d transactions | %d dates | %s to %s",
+        "normalize [bank=%s order=%s]: %d txns across %d dates | %s → %s",
         bank, sort_order, total_txns, len(real_dates),
         real_dates[0] if real_dates else "N/A",
         real_dates[-1] if real_dates else "N/A",
     )
+
     return normalized
-
-
-# ---------------------------------------------------------------------------
-# Daily balance summary
-# ---------------------------------------------------------------------------
-
-def build_daily_summary(normalized: NormTransactions) -> dict[date, DailyBalance]:
-    """
-    Build a {date: DailyBalance} map from normalized transactions.
-    first_balance and last_balance are always chronologically correct after normalize().
-    """
-    summary: dict[date, DailyBalance] = {}
-    for d, balances in normalized.items():
-        if d == OPENING_BALANCE_KEY:
-            continue
-        summary[d] = DailyBalance(
-            date=d,
-            first_balance=balances[0],
-            last_balance=balances[-1],
-            transaction_count=len(balances),
-        )
-    return summary

@@ -5,7 +5,14 @@ from typing import Optional
 import calendar
 import io
 import os
+import logging
 import pdfplumber
+
+# Show INFO logs in the uvicorn console so extraction can be traced live
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(name)s: %(message)s",
+)
 
 from parser import parse_pdf, detect_columns, _infer_columns_from_data, OPENING_BALANCE_KEY
 from normalizer import detect_bank, detect_sort_order, normalize
@@ -140,11 +147,18 @@ async def debug_pdf(
     # ── STAGE 2: normalize ────────────────────────────────────────────────────
     try:
         txns = normalize(raw_txns, bank=out["stage1_bank"])
+        _SKIP = {OPENING_BALANCE_KEY, "__sort_order__"}
+        is_desc_dbg = (txns.get("__sort_order__", "asc") == "desc")
+        out["stage2_sort_order"] = txns.get("__sort_order__", "asc")
         out["stage2_normalized"] = [
-            {"date": str(d), "balances": v,
-             "first": v[0], "last": v[-1], "count": len(v)}
+            {
+                "date": str(d),
+                "balances_pdf_order": v,
+                "selected_closing": round(v[0] if is_desc_dbg else v[-1], 2),
+                "count": len(v),
+            }
             for d, v in sorted(
-                ((d, v) for d, v in txns.items() if d != OPENING_BALANCE_KEY),
+                ((d, v) for d, v in txns.items() if d not in _SKIP),
                 key=lambda x: x[0]
             )
         ]
@@ -156,10 +170,11 @@ async def debug_pdf(
     try:
         from calculator import _fill_daily_from_txns, get_day1_balance
         monthly_groups = group_by_month(txns)
+        is_desc_dbg = (txns.get("__sort_order__", "asc") == "desc")
         out["stage3_months"] = []
         for (year, month), month_txns in monthly_groups.items():
-            filled = _fill_daily_from_txns(month_txns, year, month)
-            d1 = get_day1_balance(month_txns, txns, year, month)
+            filled = _fill_daily_from_txns(month_txns, year, month, is_desc_dbg)
+            d1 = get_day1_balance(month_txns, txns, year, month, is_desc_dbg)
             if d1 is not None:
                 filled[1] = d1
             out["stage3_months"].append({
@@ -186,7 +201,58 @@ async def debug_pdf(
     return out
 
 
-@app.post("/audit")
+@app.post("/raw-dump")
+async def raw_dump(
+    file: UploadFile = File(...),
+    password: Optional[str] = Form(None),
+):
+    """
+    Dumps the complete raw pdfplumber output for every page:
+    - All table rows exactly as pdfplumber sees them
+    - Raw text lines
+    - Final parser output (dates + balances extracted)
+    Use this to diagnose extraction failures.
+    """
+    contents = await file.read()
+    open_kwargs = {"password": password} if password else {}
+    out: dict = {"pages": []}
+
+    with pdfplumber.open(io.BytesIO(contents), **open_kwargs) as pdf:
+        out["total_pages"] = len(pdf.pages)
+        for page_num, page in enumerate(pdf.pages, start=1):
+            page_out: dict = {
+                "page": page_num,
+                "text_lines": (page.extract_text() or "").splitlines(),
+                "tables": [],
+            }
+            for tbl_i, table in enumerate(page.extract_tables() or [], start=1):
+                page_out["tables"].append({
+                    "table_index": tbl_i,
+                    "num_rows": len(table),
+                    "num_cols": len(table[0]) if table else 0,
+                    "rows": table,
+                })
+            out["pages"].append(page_out)
+
+    # Also run the parser and show what it extracted
+    try:
+        raw_txns, pdf_text = parse_pdf(contents, password=password or None)
+        real_dates = sorted(d for d in raw_txns if d != OPENING_BALANCE_KEY)
+        out["parser_result"] = {
+            "total_dates_extracted": len(real_dates),
+            "date_range": f"{real_dates[0]} to {real_dates[-1]}" if real_dates else "NONE",
+            "dates": [
+                {"date": str(d), "balances": raw_txns[d]}
+                for d in real_dates
+            ],
+            "opening_balance": raw_txns.get(OPENING_BALANCE_KEY),
+        }
+    except Exception as e:
+        out["parser_error"] = str(e)
+
+    return out
+
+
 async def audit_statement(
     file: UploadFile = File(...),
     password: Optional[str] = Form(None),
@@ -216,65 +282,59 @@ async def audit_statement(
     txns       = normalize(raw_txns, bank=bank)
 
     from calculator import _fill_daily_from_txns, get_day1_balance, _get_balance_with_fallback
+    import datetime as _dt
 
+    is_desc_audit = (sort_order == "desc")
+    _SKIP_AUDIT   = {OPENING_BALANCE_KEY, "__sort_order__"}
     out: dict = {"bank": bank, "sort_order": sort_order}
 
     # ── STAGE A: Raw Extraction ───────────────────────────────────────────────
-    # Show every transaction in PDF row order with its global row number.
     stage_a = []
     global_row = 1
     for d, balances in raw_txns.items():
         if d == OPENING_BALANCE_KEY:
             continue
         for bal in balances:
-            stage_a.append({
-                "pdf_row": global_row,
-                "date": str(d),
-                "balance": round(bal, 2),
-            })
+            stage_a.append({"pdf_row": global_row, "date": str(d), "balance": round(bal, 2)})
             global_row += 1
     out["stage_A_raw_extraction"] = stage_a
 
-    # ── STAGE B: Date Grouping ────────────────────────────────────────────────
-    # After normalization, show per-date transaction list + first/last selection.
+    # ── STAGE B: Date Grouping + closing selection ────────────────────────────
     stage_b = []
-    for d in sorted(d for d in txns if d != OPENING_BALANCE_KEY):
+    for d in sorted(d for d in txns if d not in _SKIP_AUDIT):
         balances = txns[d]
-        txn_list = {str(i + 1): round(b, 2) for i, b in enumerate(balances)}
+        closing  = balances[0] if is_desc_audit else balances[-1]
         stage_b.append({
             "date": str(d),
-            "transactions": txn_list,
-            "selected_first": round(balances[0], 2),
-            "selected_last_closing": round(balances[-1], 2),
+            "statement_order": sort_order.upper(),
+            "transactions": {str(i + 1): round(b, 2) for i, b in enumerate(balances)},
+            "selected_closing": round(closing, 2),
         })
     out["stage_B_date_grouping"] = stage_b
 
-    # ── STAGE C: Daily Closing Balance Map ───────────────────────────────────
-    # Only dates that have actual transactions (no carry-forward yet).
+    # ── STAGE C: Closing balance per date (no carry-forward) ──────────────────
     stage_c = {}
-    for d in sorted(d for d in txns if d != OPENING_BALANCE_KEY):
-        stage_c[str(d)] = round(txns[d][-1], 2)
+    for d in sorted(d for d in txns if d not in _SKIP_AUDIT):
+        balances = txns[d]
+        stage_c[str(d)] = round(balances[0] if is_desc_audit else balances[-1], 2)
     out["stage_C_closing_balance_per_date"] = stage_c
 
     # ── STAGE D: Daily Balance Fill ───────────────────────────────────────────
-    # Full month fill with carry-forward + Day 1 override.
     monthly_groups = group_by_month(txns)
     stage_d_months = []
     for (year, month), month_txns in monthly_groups.items():
-        filled = _fill_daily_from_txns(month_txns, year, month)
-        d1 = get_day1_balance(month_txns, txns, year, month)
+        filled = _fill_daily_from_txns(month_txns, year, month, is_desc_audit)
+        d1 = get_day1_balance(month_txns, txns, year, month, is_desc_audit)
         if d1 is not None:
             filled[1] = d1
-
         _, days_in_month = calendar.monthrange(year, month)
         daily_map = {}
         for day in range(1, days_in_month + 1):
-            entry: dict = {"balance": round(filled[day], 2) if day in filled else None}
-            # Flag whether this day had a real transaction or is carry-forward
-            real_date = __import__("datetime").date(year, month, day)
-            entry["source"] = "transaction" if real_date in month_txns else "carry_forward"
-            daily_map[f"{year}-{month:02d}-{day:02d}"] = entry
-
+            real_date = _dt.date(year, month, day)
+            daily_map[f"{year}-{month:02d}-{day:02d}"] = {
+                "balance": round(filled[day], 2) if day in filled else None,
+                "source": "transaction" if real_date in month_txns else "carry_forward",
+            }
         stage_d_months.append({
             "month": f"{calendar.month_name[month]} {year}",
             "daily_balance_map": daily_map,
@@ -282,12 +342,10 @@ async def audit_statement(
     out["stage_D_daily_balance_fill"] = stage_d_months
 
     # ── STAGE E: Series Selection ─────────────────────────────────────────────
-    # Show which balance was chosen for each series date and what source date
-    # the backward fallback resolved to.
     stage_e_months = []
     for (year, month), month_txns in monthly_groups.items():
-        filled = _fill_daily_from_txns(month_txns, year, month)
-        d1 = get_day1_balance(month_txns, txns, year, month)
+        filled = _fill_daily_from_txns(month_txns, year, month, is_desc_audit)
+        d1 = get_day1_balance(month_txns, txns, year, month, is_desc_audit)
         if d1 is not None:
             filled[1] = d1
 
@@ -305,10 +363,8 @@ async def audit_statement(
 
         series_5  = [resolve(d) for d in [1, 5, 10, 15, 20, 25, 30]]
         series_10 = [resolve(d) for d in [1, 10, 20, 30]]
-
         selected_5  = [e["balance_used"] for e in series_5  if e["balance_used"] is not None]
         selected_10 = [e["balance_used"] for e in series_10 if e["balance_used"] is not None]
-
         stage_e_months.append({
             "month": f"{calendar.month_name[month]} {year}",
             "5_series": series_5,

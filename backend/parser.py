@@ -188,20 +188,6 @@ def _is_summary_row(row: list, date_idx: Optional[int]) -> bool:
     )
 
 
-    """
-    Extract the balance from the confirmed balance column index.
-    Returns None if the cell is empty or not a valid amount.
-    This is the ONLY function that should be used to read balance values —
-    withdrawal and deposit columns are never touched here.
-    """
-    if bal_idx >= len(row):
-        return None
-    cell = (row[bal_idx] or "").strip()
-    if not is_valid_amount(cell):
-        return None
-    return parse_amount(cell)
-
-
 def parse_transaction_row(
     row: list[str],
     cols: dict[str, Optional[int]],
@@ -238,16 +224,11 @@ def parse_transaction_row(
 def extract_via_tables(pdf) -> dict[date, list[float]]:
     """
     Primary extraction path.
-    For each page, extract all tables, detect the header row, identify the
-    Balance column index, then parse every transaction row.
+    Iterates every page and every table. For each table, finds the header row,
+    detects column indices, then parses every data row.
 
-    Key guarantee: ONLY the Balance column value is ever recorded.
-    Withdrawal (Dr.) and Deposit (Cr.) columns are identified but ignored.
-
-    Header detection uses _is_header_row() which requires BOTH a date column
-    AND a balance column to be present — this prevents Kotak's
-    'Balance Brought Forward' and 'Closing Balance' rows from being
-    mistaken for the table header.
+    Per-page column detection: cols are re-detected on every page so that
+    multi-page PDFs with repeated headers work correctly.
     """
     daily: dict[date, list[float]] = {}
 
@@ -261,10 +242,7 @@ def extract_via_tables(pdf) -> dict[date, list[float]]:
             if not table or len(table) < 2:
                 continue
 
-            # --- Locate header row ---
-            # Use _is_header_row() which requires both date AND balance columns.
-            # This prevents data rows like 'Balance Brought Forward' from
-            # being treated as the header.
+            # Locate header row — requires both a date column AND a balance column
             header_row_idx = None
             for i, row in enumerate(table):
                 if row and _is_header_row(row):
@@ -281,48 +259,38 @@ def extract_via_tables(pdf) -> dict[date, list[float]]:
             header_row = table[header_row_idx]
             cols = detect_columns([c or "" for c in header_row])
 
-            # If header detection failed, try heuristic inference on data rows
             if cols["date"] is None or cols["balance"] is None:
                 cols = _infer_columns_from_data(table)
 
             if cols["date"] is None or cols["balance"] is None:
                 logger.debug(
-                    "Page %d table %d: could not detect date/balance columns, skipping",
+                    "Page %d table %d: could not detect columns, skipping",
                     page_num, tbl_num,
                 )
                 continue
 
-            logger.debug(
-                "Page %d table %d: header_row_idx=%d headers=%s | date_col=%s balance_col=%s",
-                page_num, tbl_num, header_row_idx,
-                [c or "" for c in header_row],
-                cols["date"], cols["balance"],
+            logger.info(
+                "Page %d table %d: header_row_idx=%d date_col=%s balance_col=%s",
+                page_num, tbl_num, header_row_idx, cols["date"], cols["balance"],
             )
 
-            # --- Parse ALL rows except the header itself ---
-            # Rows before the header (e.g. 'Balance Brought Forward') are also
-            # processed — they may contain an opening balance sentinel.
-            all_data_rows = (
-                [(i, row) for i, row in enumerate(table) if i != header_row_idx]
-            )
-
-            for _, row in all_data_rows:
-                if not row:
+            # Parse every row except the header
+            for row_i, row in enumerate(table):
+                if row_i == header_row_idx or not row:
                     continue
 
                 desc_idx  = cols.get("description")
                 date_cell = (row[cols["date"]] or "").strip() if cols["date"] is not None and cols["date"] < len(row) else ""
                 desc_cell = (row[desc_idx] or "").lower()     if desc_idx is not None and desc_idx < len(row) else ""
 
-                # Opening balance row: no date, description contains 'opening' or 'brought forward'
+                # Opening balance sentinel row
                 if not date_cell and any(kw in desc_cell for kw in ("opening", "brought forward")):
                     b = get_balance_value(row, cols["balance"])
                     if b is not None:
                         daily.setdefault(OPENING_BALANCE_KEY, []).append(b)
-                        logger.debug("  opening/BBF balance row: %.2f", b)
+                        logger.debug("  opening/BBF row: %.2f", b)
                     continue
 
-                # Skip other summary rows (closing balance, totals, etc.)
                 if _is_summary_row(row, cols["date"]):
                     logger.debug("  summary row skipped: %s", [c or "" for c in row[:4]])
                     continue
@@ -330,54 +298,94 @@ def extract_via_tables(pdf) -> dict[date, list[float]]:
                 d, b = parse_transaction_row(row, cols)
                 if d is not None and b is not None:
                     daily.setdefault(d, []).append(b)
-                    logger.debug("  row date=%s balance=%.2f", d, b)
-
-    return daily
+                    logger.info("  extracted: date=%s balance=%.2f", d, b)
 
     return daily
 
 
 # ---------------------------------------------------------------------------
-# Regex fallback extraction
+# Regex / text-line extraction
 # ---------------------------------------------------------------------------
 
-# Kotak-style line pattern:
-#   <date>  <description>  <ref>  [withdrawal]  [deposit]  <balance>
-#
-# The balance is the LAST amount on the line.
-# To avoid picking up withdrawal/deposit as balance we require the line to
-# contain at least one date AND end with an amount that is preceded by
-# at least one other amount (i.e. there are multiple amounts on the line).
-_DATE_PAT   = r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{1,2}\s+\w{3}\s+\d{4})"
-_AMOUNT_PAT = r"[\d,]+\.\d{2}\s*(?:CR|DR)?"
-
-# Matches a line that starts with a date and ends with an amount (the balance).
-# We no longer require two amounts on the line because HDFC rows often have
-# only the balance when withdrawal/deposit is blank.
-_REGEX_LINE = re.compile(
-    _DATE_PAT
-    + r".*?(" + _AMOUNT_PAT + r")\s*$",
+# Summary lines to skip — these contain dates but are NOT transactions
+_SUMMARY_LINE_RE = re.compile(
+    r"opening balance|closing balance|opening bal|closing bal",
     re.IGNORECASE,
+)
+
+# A line that contains a date AND ends with an amount (standard single-line format)
+_DATE_PAT   = r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})"
+_AMOUNT_PAT = r"(-?[\d,]+\.\d{2})\s*(?:CR|DR)?\s*$"
+_SINGLE_LINE_RE = re.compile(_DATE_PAT + r".+" + _AMOUNT_PAT, re.IGNORECASE)
+
+# A line that contains ONLY a serial number + date (Kotak split-line format)
+# e.g. "1 30/06/2021"  or  "12 29/06/2021"
+_DATE_ONLY_LINE_RE = re.compile(
+    r"^\s*\d{1,4}\s+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\s*$"
+)
+
+# An amount at the end of any line (used to grab balance from previous line)
+_TRAILING_AMOUNT_RE = re.compile(
+    r"(-?[\d,]+\.\d{2})\s*(?:CR|DR)?\s*$", re.IGNORECASE
 )
 
 
 def extract_via_regex(pdf) -> dict[date, list[float]]:
     """
-    Fallback when table extraction yields nothing.
-    Scans raw text lines; takes the LAST amount on each line as the balance.
+    Text-line extraction — handles both:
+
+    FORMAT A (single-line): date + description + amount + balance on one line
+        e.g. HDFC: "01/06/2021  NEFT  50000.00  106092.54"
+
+    FORMAT B (split-line): Kotak borderless PDF where the balance is on the
+        line ABOVE the date line:
+            Line N:   "FD PREMAT PROCEEDS 5.00 CR 103,422.24 CR"  ← balance
+            Line N+1: "1 30/06/2021"                               ← date only
+
+        Strategy: keep a rolling `prev_balance` from the last amount seen.
+        When a date-only line is found, pair it with `prev_balance`.
+
+    Summary lines ("Opening balance as on...", "Closing balance as on...")
+    are explicitly skipped so they never pollute the transaction data.
     """
     daily: dict[date, list[float]] = {}
+
     for page_num, page in enumerate(pdf.pages, start=1):
         text = page.extract_text() or ""
-        for line in text.splitlines():
-            m = _REGEX_LINE.search(line)
-            if not m:
+        lines = text.splitlines()
+        prev_balance: Optional[float] = None
+
+        for line in lines:
+            # Always skip summary/header lines
+            if _SUMMARY_LINE_RE.search(line):
+                prev_balance = None
                 continue
-            d = parse_date(m.group(1))
-            b = parse_amount(m.group(2))
-            if d and b is not None:
-                daily.setdefault(d, []).append(b)
-                logger.debug("regex page %d: date=%s balance=%.2f | line: %s", page_num, d, b, line[:80])
+
+            # FORMAT A: date and balance on the same line
+            m = _SINGLE_LINE_RE.search(line)
+            if m:
+                d = parse_date(m.group(1))
+                b = parse_amount(m.group(2))
+                if d and b is not None:
+                    daily.setdefault(d, []).append(b)
+                    prev_balance = b
+                    logger.debug("regex A page %d: %s → %.2f", page_num, d, b)
+                    continue
+
+            # FORMAT B step 1: update prev_balance from any line ending with an amount
+            tm = _TRAILING_AMOUNT_RE.search(line)
+            if tm:
+                prev_balance = parse_amount(tm.group(1))
+
+            # FORMAT B step 2: date-only line — pair with prev_balance
+            dm = _DATE_ONLY_LINE_RE.match(line)
+            if dm and prev_balance is not None:
+                d = parse_date(dm.group(1))
+                if d:
+                    daily.setdefault(d, []).append(prev_balance)
+                    logger.debug("regex B page %d: %s → %.2f", page_num, d, prev_balance)
+                    prev_balance = None  # consumed — don't reuse for next date line
+
     return daily
 
 
@@ -463,8 +471,15 @@ def parse_pdf(
         with pdfplumber.open(io.BytesIO(file_bytes), **open_kwargs) as pdf:
             pdf_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
             daily = extract_via_tables(pdf)
-            if not daily:
-                logger.info("Table extraction yielded no results, trying regex fallback")
+            # Table extraction returns only header rows for borderless PDFs like Kotak.
+            # If we got fewer than 2 unique real dates, treat it as a failure and
+            # fall through to the text-line regex extractor which handles split-line format.
+            real_from_tables = [d for d in daily if d != OPENING_BALANCE_KEY]
+            if len(real_from_tables) < 2:
+                logger.info(
+                    "Table extraction yielded %d date(s) — insufficient, trying regex",
+                    len(real_from_tables),
+                )
                 daily = extract_via_regex(pdf)
             if not daily:
                 logger.info("Regex fallback yielded no results, trying word-scan fallback")
