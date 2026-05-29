@@ -148,6 +148,60 @@ def get_balance_value(row: list[str], bal_idx: int) -> Optional[float]:
     return parse_amount(cell)
 
 
+def _is_header_row(row: list) -> bool:
+    """
+    Return True if this row looks like a proper column header row.
+    Requires BOTH a date-like column AND a balance-like column to be present
+    as separate cells, preventing data rows like 'Balance Brought Forward'
+    from being mistaken for headers.
+    """
+    cells = [c or "" for c in row]
+    has_date    = any(any(k in c.lower() for k in _DATE_KEYWORDS)    for c in cells)
+    has_balance = any(
+        "balance" in c.lower()
+        and not any(k in c.lower() for k in _WITHDRAW_KEYWORDS + _DEPOSIT_KEYWORDS)
+        and "brought" not in c.lower()
+        and "closing" not in c.lower()
+        and "opening" not in c.lower()
+        for c in cells
+    )
+    return has_date and has_balance
+
+
+def _is_summary_row(row: list, date_idx: Optional[int]) -> bool:
+    """
+    Return True if this row is a non-transaction summary row that should be
+    skipped (e.g. 'Balance Brought Forward', 'Closing Balance', 'Total').
+    These rows have an empty date cell and a description containing keywords.
+    """
+    _SUMMARY_KEYWORDS = ("brought forward", "closing balance", "opening balance",
+                         "total", "sub total", "subtotal", "carried forward")
+    # Empty date cell is the primary signal
+    if date_idx is not None and date_idx < len(row):
+        date_cell = (row[date_idx] or "").strip()
+        if date_cell:  # has a real date — not a summary row
+            return False
+    # Check all cells for summary keywords
+    return any(
+        any(kw in (c or "").lower() for kw in _SUMMARY_KEYWORDS)
+        for c in row
+    )
+
+
+    """
+    Extract the balance from the confirmed balance column index.
+    Returns None if the cell is empty or not a valid amount.
+    This is the ONLY function that should be used to read balance values —
+    withdrawal and deposit columns are never touched here.
+    """
+    if bal_idx >= len(row):
+        return None
+    cell = (row[bal_idx] or "").strip()
+    if not is_valid_amount(cell):
+        return None
+    return parse_amount(cell)
+
+
 def parse_transaction_row(
     row: list[str],
     cols: dict[str, Optional[int]],
@@ -190,9 +244,10 @@ def extract_via_tables(pdf) -> dict[date, list[float]]:
     Key guarantee: ONLY the Balance column value is ever recorded.
     Withdrawal (Dr.) and Deposit (Cr.) columns are identified but ignored.
 
-    Also detects opening balance rows (rows whose description contains
-    'opening balance' and have no date) and stores them under the special
-    key OPENING_BALANCE_KEY so the calculator can use them for Day 1 fallback.
+    Header detection uses _is_header_row() which requires BOTH a date column
+    AND a balance column to be present — this prevents Kotak's
+    'Balance Brought Forward' and 'Closing Balance' rows from being
+    mistaken for the table header.
     """
     daily: dict[date, list[float]] = {}
 
@@ -207,13 +262,21 @@ def extract_via_tables(pdf) -> dict[date, list[float]]:
                 continue
 
             # --- Locate header row ---
-            # The header row is the first row that contains a cell with 'balance'
-            # (case-insensitive). Fall back to the first non-empty row.
-            header_row_idx = 0
+            # Use _is_header_row() which requires both date AND balance columns.
+            # This prevents data rows like 'Balance Brought Forward' from
+            # being treated as the header.
+            header_row_idx = None
             for i, row in enumerate(table):
-                if row and any("balance" in (c or "").lower() for c in row):
+                if row and _is_header_row(row):
                     header_row_idx = i
                     break
+
+            # Fallback: first non-empty row
+            if header_row_idx is None:
+                header_row_idx = next(
+                    (i for i, row in enumerate(table) if any(c for c in (row or []))),
+                    0
+                )
 
             header_row = table[header_row_idx]
             cols = detect_columns([c or "" for c in header_row])
@@ -230,31 +293,46 @@ def extract_via_tables(pdf) -> dict[date, list[float]]:
                 continue
 
             logger.debug(
-                "Page %d table %d: headers=%s | date_col=%s balance_col=%s",
-                page_num, tbl_num,
+                "Page %d table %d: header_row_idx=%d headers=%s | date_col=%s balance_col=%s",
+                page_num, tbl_num, header_row_idx,
                 [c or "" for c in header_row],
                 cols["date"], cols["balance"],
             )
 
-            # --- Parse data rows (everything after the header row) ---
-            for row in table[header_row_idx + 1:]:
-                # Check for opening balance row: description contains 'opening'
-                # and date cell is empty — store under sentinel key
-                desc_idx = cols.get("description")
-                date_cell = (row[cols["date"]] or "").strip() if cols["date"] is not None and cols["date"] < len(row) else ""
-                desc_cell = (row[desc_idx] or "").lower() if desc_idx is not None and desc_idx < len(row) else ""
+            # --- Parse ALL rows except the header itself ---
+            # Rows before the header (e.g. 'Balance Brought Forward') are also
+            # processed — they may contain an opening balance sentinel.
+            all_data_rows = (
+                [(i, row) for i, row in enumerate(table) if i != header_row_idx]
+            )
 
-                if not date_cell and "opening" in desc_cell:
+            for _, row in all_data_rows:
+                if not row:
+                    continue
+
+                desc_idx  = cols.get("description")
+                date_cell = (row[cols["date"]] or "").strip() if cols["date"] is not None and cols["date"] < len(row) else ""
+                desc_cell = (row[desc_idx] or "").lower()     if desc_idx is not None and desc_idx < len(row) else ""
+
+                # Opening balance row: no date, description contains 'opening' or 'brought forward'
+                if not date_cell and any(kw in desc_cell for kw in ("opening", "brought forward")):
                     b = get_balance_value(row, cols["balance"])
                     if b is not None:
                         daily.setdefault(OPENING_BALANCE_KEY, []).append(b)
-                        logger.debug("  opening balance row detected: %.2f", b)
+                        logger.debug("  opening/BBF balance row: %.2f", b)
+                    continue
+
+                # Skip other summary rows (closing balance, totals, etc.)
+                if _is_summary_row(row, cols["date"]):
+                    logger.debug("  summary row skipped: %s", [c or "" for c in row[:4]])
                     continue
 
                 d, b = parse_transaction_row(row, cols)
                 if d is not None and b is not None:
                     daily.setdefault(d, []).append(b)
                     logger.debug("  row date=%s balance=%.2f", d, b)
+
+    return daily
 
     return daily
 
